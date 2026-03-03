@@ -1,3 +1,6 @@
+import asyncio
+import edge_tts
+import pygame
 import threading
 import queue
 import time
@@ -23,6 +26,13 @@ tts_process = None
 
 INSTAGRAM_URL = "https://www.instagram.com/its_anshmn_/"
 LINKEDIN_URL = "https://www.linkedin.com/in/anshumaansuryavanshi/"
+GITHUB_URL = "https://github.com/Anshmn-afk" # Put your GitHub link here
+LEETCODE_URL = "https://leetcode.com/u/Anshmn10/" # Put your LeetCode link here
+GEMINI_URL = "https://gemini.google.com/"
+GPT_URL = "https://chatgpt.com/"
+COMET_URL = "https://<your-comet-url>" # Put the Comet URL here
+IIT_COURSE_URL = "https://students.masaischool.com/learn?tab=lectures&lectureTab=all" # Put your IIT link here
+
 
 load_dotenv()
 client = Groq(api_key=os.environ["GROQ_API_KEY"])
@@ -95,27 +105,49 @@ def check_alpha_code(user_text: str) -> bool:
         return False
     return abs(guess - current) <= 3
 
-# ----------------- TTS worker (with interrupt) -----------------
+# Initialize pygame mixer for audio playback
+pygame.mixer.init()
 
 tts_queue: queue.Queue[str] = queue.Queue()
 tts_stop_event = threading.Event()
 tts_interrupt_event = threading.Event()
-tts_process: subprocess.Popen | None = None
-
 
 def stop_tts():
-    global tts_process
     tts_interrupt_event.set()
-    if tts_process is not None and tts_process.poll() is None:
-        try:
-            tts_process.terminate()
-        except Exception:
-            pass
-    tts_process = None
+    if pygame.mixer.music.get_busy():
+        pygame.mixer.music.stop()
 
+async def generate_and_play_audio(text: str):
+    # Choose a realistic voice. 
+    # For a cool, Jarvis-like male voice: "en-GB-RyanNeural" or "en-US-GuyNeural"
+    # For a female voice: "en-US-AriaNeural"
+    voice = "en-GB-RyanNeural" 
+    
+    # We save to a temporary file
+    output_file = os.path.join(CURRENT_DIR, "temp_reply.mp3")
+    
+    communicate = edge_tts.Communicate(text, voice)
+    await communicate.save(output_file)
+    
+    # If interrupted during generation, don't play
+    if tts_interrupt_event.is_set():
+        return
+        
+    # Play the audio
+    pygame.mixer.music.load(output_file)
+    pygame.mixer.music.play()
+    
+    # Wait for audio to finish, but break early if interrupted
+    while pygame.mixer.music.get_busy():
+        if tts_interrupt_event.is_set():
+            pygame.mixer.music.stop()
+            break
+        time.sleep(0.1)
+        
+    # Unload the file so we can overwrite it next time
+    pygame.mixer.music.unload()
 
 def tts_worker():
-    global tts_process
     while not tts_stop_event.is_set():
         try:
             text = tts_queue.get(timeout=0.1)
@@ -126,32 +158,14 @@ def tts_worker():
             tts_queue.task_done()
             continue
 
-        # collapse newlines and escape single quotes for PowerShell
-        safe = text.replace("\n", " ").replace("\r", " ")
-        safe = safe.replace("'", "''")
-
-        cmd = [
-            "powershell",
-            "-Command",
-            (
-                "Add-Type -AssemblyName System.Speech; "
-                "$speak = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-                f"$speak.Speak('{safe}')"
-            ),
-        ]
-
-        tts_process = subprocess.Popen(cmd)
-        tts_process.wait()
-        tts_process = None
+        # Run the async edge-tts generation and playback
+        asyncio.run(generate_and_play_audio(text))
 
         tts_queue.task_done()
-
-
 
 tts_thread = threading.Thread(target=tts_worker, daemon=True)
 tts_thread.start()
 
-       
 # ----------------- LLM helpers -----------------
 
 
@@ -170,6 +184,18 @@ Intents:
 - alpha
 - show commands
 - open spotify
+- get time
+- open github
+- open leetcode
+- open gemini
+- open gpt
+- open comet
+- open netflix
+- open amazon prime
+- open hotstar
+- open airtel
+- open movie sites
+- open iit course
 - chat
 - none
 
@@ -178,14 +204,34 @@ User says: "{text}"
 Rules:
 - "enter alpha mode", "alpha mode" -> alpha
 - "list commands", "show commands" -> show commands
+- "what is the time", "what's the time", "time" -> get time
+- "open github" -> open github
+- "open leetcode" -> open leetcode
+- "open gemini" -> open gemini
+- "open gpt", "open chat gpt" -> open gpt
+- "open comet" -> open comet
+- "open netflix" -> open netflix
+- "open amazon prime", "open prime" -> open amazon prime
+- "open hotstar", "open disney" -> open hotstar
+- "open airtel", "open airtel extreme" -> open airtel
+- "watch a movie", "some movie", "open movie sites" -> open movie sites
+- "open iit course", "open roorkee course" -> open iit course
 - "open youtube" -> open youtube
 - "search for...", "play ... on youtube" -> search youtube
 - "downloads" -> open downloads
 - "play music", "open spotify" -> open spotify
 - "stop", "exit", "goodbye" -> goodbye
-- humor settings -> set humor / get humor
-- wake words only ("raptor", "hello") -> none
-- anything else / questions -> chat
+
+# HUMOR SETTINGS (System configs)
+- "what is your humor level", "how funny are you" -> get humor
+- "set humor to", "be more funny", "be serious" -> set humor
+
+# CHAT & JOKES (Pass to LLM)
+- "tell me a joke", "make me laugh", "say a joke" -> chat
+- ALL QUESTIONS, CHAT, OR UNKNOWN COMMANDS ("who are you", "what is...", "tell me...") -> chat
+
+# WAKE WORDS
+- WAKE WORDS ONLY ("raptor", "hello", "are you there") -> none
 """
     chat_completion = client.chat.completions.create(
         model=MODEL,
@@ -200,7 +246,6 @@ Rules:
         max_tokens=10,
     )
     return chat_completion.choices[0].message.content.strip().lower()
-
 
 
 def raptor_chat(user_text: str) -> str:
@@ -247,12 +292,9 @@ def raptor_chat(user_text: str) -> str:
 
 def speak(text: str):
     print("Raptor:", text)
-    # interrupt any ongoing speech and enqueue the new text
-    tts_interrupt_event.set()
-    tts_queue.put(text)
-    # clear flag so worker will speak the next item
+    stop_tts()
     tts_interrupt_event.clear()
-
+    tts_queue.put(text)
 
 def parse_humor_level(text: str) -> int | None:
     match = re.search(r"(\d{1,3})\s*%?", text)
@@ -379,6 +421,23 @@ def play_spotify():
         print("Failed to open Spotify:", e)
         speak("I couldn't open the Spotify app.")
 
+def tell_time():
+    now = datetime.now()
+    time_str = now.strftime("%I:%M %p")
+    speak(f"Sir, the current time is {time_str}.")
+
+def open_all_movie_sites():
+    speak("Opening entertainment protocols. Netflix, Prime, Hotstar, and Airtel Xstream are launching.")
+    # Opens each URL in a new tab in the default browser [web:310, web:311]
+    webbrowser.open_new_tab("https://www.netflix.com")
+    time.sleep(0.5)
+    webbrowser.open_new_tab("https://www.primevideo.com")
+    time.sleep(0.5)
+    webbrowser.open_new_tab("https://www.hotstar.com")
+    time.sleep(0.5)
+    webbrowser.open_new_tab("https://www.airtelxstream.in")
+
+
 # ----------------- Command router -----------------
 
 def handle_command(text: str) -> bool:
@@ -449,19 +508,61 @@ def handle_command(text: str) -> bool:
             speak("I am already in alpha mode.")
         return True
 
-    # ---- alpha-only commands ----
+        # ---- alpha-only commands ----
     if alpha_mode:
         if "show commands" in t:
             speak_commands_list()
             return True
-
-        if "instagram" in lower:
+        if "instagram" in t or "instagram" in lower:
             open_instagram()
             return True
-
-        if "linkedin" in lower:
+        if "linkedin" in t or "linkedin" in lower:
             open_linkedin()
             return True
+        if "github" in t or "github" in lower:
+            speak("Opening GitHub.")
+            webbrowser.open(GITHUB_URL)
+            return True
+        if "leetcode" in t or "leetcode" in lower:
+            speak("Opening LeetCode.")
+            webbrowser.open(LEETCODE_URL)
+            return True
+        if "gemini" in t or "gemini" in lower:
+            speak("Opening Google Gemini.")
+            webbrowser.open(GEMINI_URL)
+            return True
+        if "gpt" in t or "gpt" in lower:
+            speak("Opening ChatGPT.")
+            webbrowser.open(GPT_URL)
+            return True
+        if "comet" in t or "comet" in lower:
+            speak("Opening Comet.")
+            webbrowser.open(COMET_URL)
+            return True
+        if "netflix" in t or "netflix" in lower:
+            speak("Opening Netflix.")
+            webbrowser.open("https://www.netflix.com")
+            return True
+        if "amazon prime" in t or "prime" in lower:
+            speak("Opening Amazon Prime Video.")
+            webbrowser.open("https://www.primevideo.com")
+            return True
+        if "hotstar" in t or "disney" in lower:
+            speak("Opening Disney Plus Hotstar.")
+            webbrowser.open("https://www.hotstar.com")
+            return True
+        if "airtel" in t or "xstream" in lower:
+            speak("Opening Airtel Xstream.")
+            webbrowser.open("https://www.airtelxstream.in")
+            return True
+        if "movie sites" in t or "watch a movie" in lower or "some movie" in lower:
+            open_all_movie_sites()
+            return True
+        if "iit course" in t or "roorkee course" in lower:
+            speak("Opening your IIT Roorkee dashboard.")
+            webbrowser.open(IIT_COURSE_URL)
+            return True
+
 
     # ---- normal shared commands below ----
     if "open youtube" in t:
@@ -476,6 +577,10 @@ def handle_command(text: str) -> bool:
 
     elif "open spotify" in t or "play music" in t:
         play_spotify()
+        return True
+    
+    elif "get time" in t:
+        tell_time()
         return True
 
     elif (

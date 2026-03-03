@@ -1,6 +1,5 @@
 import asyncio
 import edge_tts
-import pygame
 import threading
 import queue
 import time
@@ -18,21 +17,30 @@ from groq import Groq
 from datetime import datetime
 import subprocess
 import pyautogui
+from io import BytesIO
+from pydub import AudioSegment
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Point pydub to your local ffmpeg binaries
+AudioSegment.converter = os.path.join(CURRENT_DIR, "ffmpeg", "ffmpeg.exe")
+AudioSegment.ffmpeg = os.path.join(CURRENT_DIR, "ffmpeg", "ffmpeg.exe")
+AudioSegment.ffprobe = os.path.join(CURRENT_DIR, "ffmpeg", "ffprobe.exe")
 
 # ----------------- Config & setup -----------------
 alpha_mode = False          # inside alpha mode or not
 alpha_pending = False       # waiting for time-based code
+alpha_strikes = 0           # tracking failed attempts
 tts_process = None
 
 INSTAGRAM_URL = "https://www.instagram.com/its_anshmn_/"
 LINKEDIN_URL = "https://www.linkedin.com/in/anshumaansuryavanshi/"
-GITHUB_URL = "https://github.com/Anshmn-afk" # Put your GitHub link here
-LEETCODE_URL = "https://leetcode.com/u/Anshmn10/" # Put your LeetCode link here
+GITHUB_URL = "https://github.com/Anshmn-afk" 
+LEETCODE_URL = "https://leetcode.com/u/Anshmn10/" 
 GEMINI_URL = "https://gemini.google.com/"
 GPT_URL = "https://chatgpt.com/"
 COMET_URL = "https://<your-comet-url>" # Put the Comet URL here
-IIT_COURSE_URL = "https://students.masaischool.com/learn?tab=lectures&lectureTab=all" # Put your IIT link here
-
+IIT_COURSE_URL = "https://students.masaischool.com/learn?tab=lectures&lectureTab=all"
 
 load_dotenv()
 client = Groq(api_key=os.environ["GROQ_API_KEY"])
@@ -40,14 +48,11 @@ MODEL = "llama-3.1-8b-instant"
 
 ACCESS_KEY = os.environ.get("PORCUPINE_ACCESS_KEY", "")
 
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-
 WAKE_WORD_PATH = os.path.join(
     CURRENT_DIR, "wake-words", "Raptor_en_windows_v4_0_0.ppn"
 )
 
 CONFIG_PATH = os.path.join(CURRENT_DIR, "raptor_config.json")
-
 
 def load_config() -> dict:
     if not os.path.exists(CONFIG_PATH):
@@ -61,14 +66,12 @@ def load_config() -> dict:
     except Exception:
         return {"humor_level": 30}
 
-
 def save_config(cfg: dict) -> None:
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
     except Exception as e:
         print("Failed to save config:", e)
-
 
 config = load_config()
 
@@ -105,49 +108,71 @@ def check_alpha_code(user_text: str) -> bool:
         return False
     return abs(guess - current) <= 3
 
-# Initialize pygame mixer for audio playback
-pygame.mixer.init()
-
+# TTS
 tts_queue: queue.Queue[str] = queue.Queue()
 tts_stop_event = threading.Event()
 tts_interrupt_event = threading.Event()
 
 def stop_tts():
     tts_interrupt_event.set()
-    if pygame.mixer.music.get_busy():
-        pygame.mixer.music.stop()
 
-async def generate_and_play_audio(text: str):
-    # Choose a realistic voice. 
-    # For a cool, Jarvis-like male voice: "en-GB-RyanNeural" or "en-US-GuyNeural"
-    # For a female voice: "en-US-AriaNeural"
+async def stream_and_play_audio(text: str):
     voice = "en-GB-RyanNeural" 
-    
-    # We save to a temporary file
-    output_file = os.path.join(CURRENT_DIR, "temp_reply.mp3")
-    
     communicate = edge_tts.Communicate(text, voice)
-    await communicate.save(output_file)
     
-    # If interrupted during generation, don't play
-    if tts_interrupt_event.is_set():
+    # We will accumulate mp3 bytes in memory
+    mp3_bytes = b""
+    
+    try:
+        async for chunk in communicate.stream():
+            if tts_interrupt_event.is_set():
+                return # Stop downloading immediately if interrupted
+
+            if chunk["type"] == "audio":
+                mp3_bytes += chunk["data"]
+    except Exception as e:
+        print("TTS Stream error:", e)
         return
         
-    # Play the audio
-    pygame.mixer.music.load(output_file)
-    pygame.mixer.music.play()
-    
-    # Wait for audio to finish, but break early if interrupted
-    while pygame.mixer.music.get_busy():
+    if tts_interrupt_event.is_set() or not mp3_bytes:
+        return
+
+    # Decode mp3 bytes to raw audio data
+    try:
+        audio_segment = AudioSegment.from_file(BytesIO(mp3_bytes), format="mp3")
+        raw_data = audio_segment.raw_data
+        sample_rate = audio_segment.frame_rate
+        channels = audio_segment.channels
+        sample_width = audio_segment.sample_width
+    except Exception as e:
+        print("Audio decode error:", e)
+        return
+
+    # Play the raw audio using PyAudio
+    p = pyaudio.PyAudio()
+    stream = p.open(
+        format=p.get_format_from_width(sample_width),
+        channels=channels,
+        rate=sample_rate,
+        output=True
+    )
+
+    # Play in small chunks so we can interrupt it mid-sentence
+    chunk_size = 1024
+    for i in range(0, len(raw_data), chunk_size):
         if tts_interrupt_event.is_set():
-            pygame.mixer.music.stop()
-            break
-        time.sleep(0.1)
-        
-    # Unload the file so we can overwrite it next time
-    pygame.mixer.music.unload()
+            break # Stop playing immediately
+        stream.write(raw_data[i:i+chunk_size])
+
+    stream.stop_stream()
+    stream.close()
+    p.terminate()
 
 def tts_worker():
+    # Create one permanent event loop for the worker thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
     while not tts_stop_event.is_set():
         try:
             text = tts_queue.get(timeout=0.1)
@@ -158,16 +183,20 @@ def tts_worker():
             tts_queue.task_done()
             continue
 
-        # Run the async edge-tts generation and playback
-        asyncio.run(generate_and_play_audio(text))
+        # Run the async function using the persistent loop
+        try:
+            loop.run_until_complete(stream_and_play_audio(text))
+        except Exception as e:
+            print(f"Error in TTS playback: {e}")
 
         tts_queue.task_done()
+        
+    loop.close()
 
 tts_thread = threading.Thread(target=tts_worker, daemon=True)
 tts_thread.start()
 
 # ----------------- LLM helpers -----------------
-
 
 def ask_groq_as_parser(text: str) -> str:
     prompt = f"""
@@ -247,7 +276,6 @@ Rules:
     )
     return chat_completion.choices[0].message.content.strip().lower()
 
-
 def raptor_chat(user_text: str) -> str:
     global alpha_mode
     
@@ -285,10 +313,7 @@ def raptor_chat(user_text: str) -> str:
     )
     return chat_completion.choices[0].message.content.strip()
 
-
 # ----------------- Raptor helpers -----------------
-
-
 
 def speak(text: str):
     print("Raptor:", text)
@@ -313,7 +338,6 @@ def parse_humor_level(text: str) -> int | None:
 
     return None
 
-
 def handle_set_humor(text: str):
     level = parse_humor_level(text.lower())
     if level is None:
@@ -331,7 +355,6 @@ def handle_set_humor(text: str):
     else:
         speak("Perfect. Full Raptor comedy mode activated.")
     return True
-
 
 def handle_get_humor():
     level = config.get("humor_level", 30)
@@ -388,7 +411,6 @@ def check_alpha_code(user_text: str) -> bool:
     
     return match_12h or match_24h
 
-
 def speak_commands_list():
     lines = [
         "In alpha mode, I can do everything from normal mode, plus:",
@@ -398,15 +420,14 @@ def speak_commands_list():
     ]
     speak(" ".join(lines))
 
-
 def open_instagram():
     speak("Opening your Instagram profile.")
     webbrowser.open(INSTAGRAM_URL)
 
-
 def open_linkedin():
     speak("Opening your LinkedIn profile.")
     webbrowser.open(LINKEDIN_URL)
+
 def play_spotify():
     speak("Opening Spotify and playing your music.")
     # On Windows, 'spotify' is usually registered as a protocol handler or executable
@@ -428,7 +449,7 @@ def tell_time():
 
 def open_all_movie_sites():
     speak("Opening entertainment protocols. Netflix, Prime, Hotstar, and Airtel Xstream are launching.")
-    # Opens each URL in a new tab in the default browser [web:310, web:311]
+    # Opens each URL in a new tab in the default browser 
     webbrowser.open_new_tab("https://www.netflix.com")
     time.sleep(0.5)
     webbrowser.open_new_tab("https://www.primevideo.com")
@@ -436,7 +457,6 @@ def open_all_movie_sites():
     webbrowser.open_new_tab("https://www.hotstar.com")
     time.sleep(0.5)
     webbrowser.open_new_tab("https://www.airtelxstream.in")
-
 
 # ----------------- Command router -----------------
 
@@ -479,7 +499,6 @@ def handle_command(text: str) -> bool:
 
     # ---- 2. ALPHA EXIT CHECK ----
     # Catch exit commands before sending to Groq so they don't get swallowed
-
     if "exit alpha" in lower or "close alpha" in lower or "leave alpha" in lower:
         if alpha_mode:
             alpha_mode = False
@@ -563,7 +582,6 @@ def handle_command(text: str) -> bool:
             webbrowser.open(IIT_COURSE_URL)
             return True
 
-
     # ---- normal shared commands below ----
     if "open youtube" in t:
         speak("Opening YouTube")
@@ -617,9 +635,7 @@ def handle_command(text: str) -> bool:
 
     return True
 
-
 # ----------------- Listener thread -----------------
-
 
 class ListenerThread(threading.Thread):
     def __init__(self, command_queue: queue.Queue, stop_event: threading.Event):
@@ -670,7 +686,6 @@ class ListenerThread(threading.Thread):
 
 # ----------------- Main loop -----------------
 
-
 def main():
     cmd_queue: queue.Queue[str] = queue.Queue()
     stop_event = threading.Event()
@@ -703,7 +718,6 @@ def main():
         tts_stop_event.set()
         tts_thread.join(timeout=1.0)
         print("Cleaned up audio and TTS.")
-
 
 if __name__ == "__main__":
     main()

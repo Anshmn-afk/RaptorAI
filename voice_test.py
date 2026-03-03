@@ -18,15 +18,20 @@ from datetime import datetime
 import subprocess
 import pyautogui
 from io import BytesIO
+
+# --- FIX FFMPEG PATH BEFORE IMPORTING PYDUB ---
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+FFMPEG_DIR = os.path.join(CURRENT_DIR, "ffmpeg")
+
+# Temporarily add the local ffmpeg folder to Windows PATH for this script
+os.environ["PATH"] += os.pathsep + FFMPEG_DIR
+
 from pydub import AudioSegment
 
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Point pydub to your local ffmpeg binaries
-AudioSegment.converter = os.path.join(CURRENT_DIR, "ffmpeg", "ffmpeg.exe")
-AudioSegment.ffmpeg = os.path.join(CURRENT_DIR, "ffmpeg", "ffmpeg.exe")
-AudioSegment.ffprobe = os.path.join(CURRENT_DIR, "ffmpeg", "ffprobe.exe")
-
+# Keeping these as a fallback
+AudioSegment.converter = os.path.join(FFMPEG_DIR, "ffmpeg.exe")
+AudioSegment.ffmpeg = os.path.join(FFMPEG_DIR, "ffmpeg.exe")
+AudioSegment.ffprobe = os.path.join(FFMPEG_DIR, "ffprobe.exe")
 # ----------------- Config & setup -----------------
 alpha_mode = False          # inside alpha mode or not
 alpha_pending = False       # waiting for time-based code
@@ -120,16 +125,16 @@ async def stream_and_play_audio(text: str):
     voice = "en-GB-RyanNeural" 
     communicate = edge_tts.Communicate(text, voice)
     
-    # We will accumulate mp3 bytes in memory
-    mp3_bytes = b""
+    # We will accumulate all mp3 bytes in memory incredibly fast
+    mp3_bytes = bytearray()
     
     try:
         async for chunk in communicate.stream():
             if tts_interrupt_event.is_set():
-                return # Stop downloading immediately if interrupted
+                return 
 
             if chunk["type"] == "audio":
-                mp3_bytes += chunk["data"]
+                mp3_bytes.extend(chunk["data"])
     except Exception as e:
         print("TTS Stream error:", e)
         return
@@ -137,7 +142,7 @@ async def stream_and_play_audio(text: str):
     if tts_interrupt_event.is_set() or not mp3_bytes:
         return
 
-    # Decode mp3 bytes to raw audio data
+    # Decode the full smooth audio once it's done downloading (~1 second delay)
     try:
         audio_segment = AudioSegment.from_file(BytesIO(mp3_bytes), format="mp3")
         raw_data = audio_segment.raw_data
@@ -148,7 +153,7 @@ async def stream_and_play_audio(text: str):
         print("Audio decode error:", e)
         return
 
-    # Play the raw audio using PyAudio
+    # Play the raw audio smoothly
     p = pyaudio.PyAudio()
     stream = p.open(
         format=p.get_format_from_width(sample_width),
@@ -157,11 +162,11 @@ async def stream_and_play_audio(text: str):
         output=True
     )
 
-    # Play in small chunks so we can interrupt it mid-sentence
-    chunk_size = 1024
+    # Play in chunks to allow interruption
+    chunk_size = 4096
     for i in range(0, len(raw_data), chunk_size):
         if tts_interrupt_event.is_set():
-            break # Stop playing immediately
+            break 
         stream.write(raw_data[i:i+chunk_size])
 
     stream.stop_stream()
@@ -647,10 +652,14 @@ class ListenerThread(threading.Thread):
         print("Listener thread started. Say 'raptor' to wake me.")
 
         while not self.stop_event.is_set():
-            pcm = audio_stream.read(
-                porcupine.frame_length,
-                exception_on_overflow=False,
-            )
+            try:
+                pcm = audio_stream.read(
+                    porcupine.frame_length,
+                    exception_on_overflow=False,
+                )
+            except OSError:
+                break # Safely exit the loop if the audio stream closes
+
             pcm = struct.unpack_from("h" * porcupine.frame_length, pcm)
             keyword_index = porcupine.process(pcm)
 
